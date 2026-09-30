@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fusion-mcp-client"
+version = "0.1.0"
+description = "Small Python client and CLI for Autodesk Fusion's local MCP endpoint"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "hitsmaxft" }]
+keywords = ["autodesk", "fusion", "mcp", "cad"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+]
+
+[project.urls]
+Repository = "https://github.com/hitsmaxft/fusion-mcp-client"
+Issues = "https://github.com/hitsmaxft/fusion-mcp-client/issues"
+
+[project.scripts]
+fusion-mcp = "fusion_mcp_client.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fusion_mcp_client"]
