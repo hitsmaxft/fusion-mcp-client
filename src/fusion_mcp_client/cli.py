@@ -106,6 +106,34 @@ def build_parser() -> argparse.ArgumentParser:
 
     save = sub.add_parser("save", help="Save the active Fusion document")
     save.add_argument("--summary", default="Save document", help="Short save summary")
+    snapshot = sub.add_parser(
+        "snapshot", help="Read document ID/version and body inventory in mm"
+    )
+    snapshot.add_argument("--output", type=Path)
+    bundle = sub.add_parser(
+        "bundle", help="Export F3D, selected STL/OBJ, current viewport and checksums"
+    )
+    bundle.add_argument(
+        "output", type=Path, help="New output directory on Fusion's local filesystem"
+    )
+    bundle.add_argument(
+        "--body",
+        action="append",
+        required=True,
+        help="Exact body name or snapshot selector; repeatable",
+    )
+    bundle.add_argument("--tolerance-mm", type=float, default=0.01)
+    for command in (run, save, bundle):
+        command.add_argument(
+            "--expect-document",
+            required=command is bundle,
+            help="Expected Fusion dataFile ID",
+        )
+        command.add_argument(
+            "--expect-version",
+            type=int,
+            help="Expected saved version; requires --expect-document",
+        )
     return parser
 
 
@@ -133,7 +161,14 @@ def main(argv: list[str] | None = None) -> int:
                     if args.script == "-"
                     else Path(args.script).read_text(encoding="utf-8")
                 )
-                _print(fusion.execute_script(script, read_only=not args.write))
+                _print(
+                    fusion.execute_script(
+                        script,
+                        read_only=not args.write,
+                        expected_document_id=args.expect_document,
+                        expected_version=args.expect_version,
+                    )
+                )
             elif args.command == "screenshot":
                 path = fusion.capture_screenshot(
                     direction=args.direction,
@@ -144,7 +179,33 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 print(path)
             elif args.command == "save":
-                _print(fusion.save_document(args.summary))
+                _print(
+                    fusion.save_document(
+                        args.summary,
+                        expected_document_id=args.expect_document,
+                        expected_version=args.expect_version,
+                    )
+                )
+            elif args.command == "snapshot":
+                value = fusion.snapshot()
+                if args.output:
+                    args.output.parent.mkdir(parents=True, exist_ok=True)
+                    args.output.write_text(
+                        json.dumps(value, ensure_ascii=False, indent=2) + "\n"
+                    )
+                    print(args.output.resolve())
+                else:
+                    _print(value)
+            elif args.command == "bundle":
+                print(
+                    fusion.export_bundle(
+                        args.output,
+                        bodies=args.body,
+                        expected_document_id=args.expect_document,
+                        expected_version=args.expect_version,
+                        tolerance_mm=args.tolerance_mm,
+                    )
+                )
     except (FusionMCPError, OSError, ValueError) as exc:
         print(f"fusion-mcp: {exc}", file=sys.stderr)
         return 1

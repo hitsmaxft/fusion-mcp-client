@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
+import math
 import os
 import tempfile
 import urllib.error
 import urllib.request
+import zipfile
 from pathlib import Path
 from types import TracebackType
 from typing import Any
@@ -61,7 +64,12 @@ def unwrap_tool_result(result: dict[str, Any]) -> Any:
         ]
         raise FusionToolError("; ".join(messages) or "Fusion tool failed")
     if "structuredContent" in result:
-        return result["structuredContent"]
+        value = result["structuredContent"]
+        if isinstance(value, dict) and value.get("success") is False:
+            raise FusionToolError(
+                str(value.get("error") or value.get("message") or value)
+            )
+        return value
     blocks = result.get("content", [])
     if len(blocks) == 1 and blocks[0].get("type") == "text":
         value = blocks[0].get("text", "")
@@ -150,6 +158,11 @@ class FusionMCPClient:
             raise MCPTransportError(
                 f"HTTP {exc.code} from {self.url}: {detail}"
             ) from exc
+        except (TimeoutError, ConnectionError) as exc:
+            raise MCPTransportError(
+                "Connection timed out or broke; Fusion may still be executing. "
+                "Inspect the active document before retrying a write."
+            ) from exc
         except urllib.error.URLError as exc:
             raise MCPTransportError(
                 f"Could not reach {self.url}: {exc.reason}"
@@ -209,7 +222,7 @@ class FusionMCPClient:
             {
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {},
-                "clientInfo": {"name": "fusion-mcp-client", "version": "0.1.0"},
+                "clientInfo": {"name": "fusion-mcp-client", "version": "0.2.0"},
             },
         )
         if not isinstance(result, dict):
@@ -232,7 +245,12 @@ class FusionMCPClient:
             try:
                 with urllib.request.urlopen(request, timeout=min(self.timeout, 5.0)):
                     pass
-            except (urllib.error.HTTPError, urllib.error.URLError):
+            except (
+                urllib.error.HTTPError,
+                urllib.error.URLError,
+                TimeoutError,
+                ConnectionError,
+            ):
                 # Session termination is optional in the 2025 MCP transport.
                 pass
         self.session_id = None
@@ -266,16 +284,44 @@ class FusionMCPClient:
             raise ValueError("read requires queryType")
         return unwrap_tool_result(self.call_tool("fusion_mcp_read", query))
 
-    def execute_script(self, script: str, *, read_only: bool = True) -> Any:
+    def execute_script(
+        self,
+        script: str,
+        *,
+        read_only: bool = True,
+        expected_document_id: str | None = None,
+        expected_version: int | None = None,
+    ) -> Any:
         if "def run(" not in script:
             raise ValueError("Fusion script must define run(_context: str)")
+        self._validate_expectation(expected_document_id, expected_version)
+        if expected_document_id is not None:
+            from .fusion_scripts import guarded_script
+
+            script = guarded_script(script, expected_document_id, expected_version)
         arguments = {
             "featureType": "script",
             "object": {"script": script, "readOnly": read_only},
         }
         return unwrap_tool_result(self.call_tool("fusion_mcp_execute", arguments))
 
-    def save_document(self, summary: str = "Save document") -> Any:
+    def save_document(
+        self,
+        summary: str = "Save document",
+        *,
+        expected_document_id: str | None = None,
+        expected_version: int | None = None,
+    ) -> Any:
+        self._validate_expectation(expected_document_id, expected_version)
+        if expected_document_id is not None:
+            from .fusion_scripts import save_script
+
+            return self._script_result(
+                self.execute_script(
+                    save_script(summary, expected_document_id, expected_version),
+                    read_only=False,
+                )
+            )
         arguments = {
             "featureType": "document",
             "object": {
@@ -284,6 +330,123 @@ class FusionMCPClient:
             },
         }
         return unwrap_tool_result(self.call_tool("fusion_mcp_execute", arguments))
+
+    @staticmethod
+    def _validate_expectation(document_id: str | None, version: int | None) -> None:
+        if document_id is not None and (
+            not isinstance(document_id, str) or not document_id.strip()
+        ):
+            raise ValueError("expected_document_id must be a nonempty string")
+        if version is not None:
+            if not document_id:
+                raise ValueError("expected_version requires expected_document_id")
+            if type(version) is not int or version < 1:
+                raise ValueError("expected_version must be a positive integer")
+
+    @staticmethod
+    def _script_result(result: Any) -> dict[str, Any]:
+        from .fusion_scripts import MARKER
+
+        message = result.get("message", "") if isinstance(result, dict) else result
+        if not isinstance(message, str):
+            raise MCPProtocolError("Fusion script returned no textual result")
+        lines = [
+            line[len(MARKER) :]
+            for line in message.splitlines()
+            if line.startswith(MARKER)
+        ]
+        if len(lines) != 1:
+            raise MCPProtocolError("Fusion script returned no unique result marker")
+        try:
+            value = json.loads(lines[0])
+        except ValueError as exc:
+            raise MCPProtocolError("Invalid Fusion script result JSON") from exc
+        if not isinstance(value, dict):
+            raise MCPProtocolError("Fusion script result is not an object")
+        return value
+
+    def snapshot(self) -> dict[str, Any]:
+        """Read document identity, assembly body bounds (mm), and feature warnings."""
+        from .fusion_scripts import snapshot_script
+
+        return self._script_result(self.execute_script(snapshot_script()))
+
+    def export_bundle(
+        self,
+        output: str | Path,
+        *,
+        bodies: list[str],
+        expected_document_id: str,
+        expected_version: int | None = None,
+        tolerance_mm: float = 0.01,
+    ) -> Path:
+        """Export saved local Fusion design and explicit bodies into a new folder.
+
+        Requires a shared filesystem with Fusion. A failed/timed-out export
+        keeps its INCOMPLETE marker; it is never automatically replayed.
+        """
+        from .fusion_scripts import export_script
+
+        self._validate_expectation(expected_document_id, expected_version)
+        if not expected_document_id:
+            raise ValueError("export_bundle requires expected_document_id")
+        if not bodies or any(not isinstance(b, str) or not b.strip() for b in bodies):
+            raise ValueError(
+                "Select at least one body by exact name or snapshot selector"
+            )
+        if len(set(bodies)) != len(bodies):
+            raise ValueError("Duplicate body selectors")
+        if not math.isfinite(tolerance_mm) or tolerance_mm <= 0:
+            raise ValueError("tolerance_mm must be finite and positive")
+        folder = Path(output).expanduser().resolve()
+        folder.mkdir(parents=True, exist_ok=False, mode=0o700)
+        incomplete = folder / "INCOMPLETE"
+        incomplete.write_text(
+            "Export has not completed. Do not treat this directory as a verified delivery.\n"
+        )
+        options = {
+            "folder": str(folder),
+            "bodies": bodies,
+            "expected_id": expected_document_id,
+            "expected_version": expected_version,
+            "tolerance_mm": tolerance_mm,
+        }
+        try:
+            result = self._script_result(self.execute_script(export_script(options)))
+            required = ["design.f3d", "current.png", "snapshot.json"]
+            required += [
+                f"part-{i:02d}.{ext}"
+                for i in range(1, len(bodies) + 1)
+                for ext in ("obj", "stl")
+            ]
+            for name in required:
+                if not (folder / name).is_file() or not (folder / name).stat().st_size:
+                    raise MCPProtocolError("Missing exported file: " + name)
+            if not zipfile.is_zipfile(folder / "design.f3d"):
+                raise MCPProtocolError("Fusion archive is not a ZIP container")
+            if (
+                not (folder / "current.png")
+                .read_bytes()
+                .startswith(b"\x89PNG\r\n\x1a\n")
+            ):
+                raise MCPProtocolError("Exported screenshot is not a PNG")
+            result["files"] = [
+                {
+                    "path": name,
+                    "bytes": (folder / name).stat().st_size,
+                    "sha256": hashlib.sha256((folder / name).read_bytes()).hexdigest(),
+                }
+                for name in required
+            ]
+            (folder / "manifest.json").write_text(
+                json.dumps(result, ensure_ascii=False, indent=2) + "\n"
+            )
+            incomplete.unlink()
+            return folder
+        except Exception as exc:
+            raise FusionMCPError(
+                f"Bundle incomplete at {folder}: {exc}. Inspect Fusion before retrying."
+            ) from exc
 
     def capture_screenshot(
         self,
